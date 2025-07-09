@@ -105,6 +105,29 @@ bool close_socket(dpp::socket sfd)
 	return false;
 }
 
+std::string get_socket_error() {
+#ifdef _WIN32
+	wchar_t *wide_buffer{nullptr};
+	std::string message{"Unknown error"};
+
+	FormatMessageW(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr, WSAGetLastError(), 0, reinterpret_cast<LPWSTR>(&wide_buffer), 0, nullptr
+	);
+	if (wide_buffer) {
+		int size_needed = WideCharToMultiByte(CP_UTF8, 0, wide_buffer, -1, nullptr, 0, nullptr, nullptr);
+		if (size_needed > 0) {
+			message.resize(size_needed - 1);
+			WideCharToMultiByte(CP_UTF8, 0, wide_buffer, -1, message.data(), size_needed, nullptr, nullptr);
+		}
+		LocalFree(wide_buffer);
+	}
+	return message;
+#else
+	return strerror(errno);
+#endif
+}
+
 bool set_nonblocking(dpp::socket sockfd, bool non_blocking)
 {
 	const int enable{1};
@@ -129,19 +152,7 @@ bool set_nonblocking(dpp::socket sockfd, bool non_blocking)
 	return true;
 }
 
-/**
- * @brief Start connecting to a TCP socket.
- * This simply calls connect() and checks for error return, as the timeout is now handled in the main
- * IO events for the ssl_connection class.
- * 
- * @param sockfd socket descriptor
- * @param addr address to connect to
- * @param addrlen address length
- * @param timeout_ms timeout in milliseconds
- * @return int -1 on error, 0 on success just like POSIX connect()
- * @throw dpp::connection_exception on failure
- */
-int start_connecting(dpp::socket sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+int ssl_connection::start_connecting(dpp::socket sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 	if (!set_nonblocking(sockfd, true)) {
 		throw dpp::connection_exception(err_nonblocking_failure, "Can't switch socket to non-blocking mode!");
 	}
@@ -152,14 +163,24 @@ int start_connecting(dpp::socket sockfd, const struct sockaddr *addr, socklen_t 
 	ULONG non_blocking = 1;
 	ioctlsocket(sockfd, FIONBIO, &non_blocking);
 	int rc = WSAConnect(sockfd, addr, addrlen, nullptr, nullptr, nullptr, nullptr);
-	int err = EWOULDBLOCK;
+	int err = ((rc == SOCKET_ERROR) ? WSAGetLastError() : 0);
 #else
 	/* Standard POSIX connection behaviour */
 	int rc = (::connect(sockfd, addr, addrlen));
 	int err = errno;
 #endif
-	if (rc == -1 && err != EWOULDBLOCK && err != EINPROGRESS) {
-		throw connection_exception(err_connect_failure, strerror(errno));
+	if (rc == -1
+#ifdef _WIN32
+		&& err != WSAEWOULDBLOCK
+#endif
+		&& err != EWOULDBLOCK && err != EINPROGRESS) {
+		throw connection_exception(err_connect_failure, get_socket_error());
+	} else if (rc == 0) {
+		/* We are ready RIGHT NOW, connection already succeeded */
+		socket_events ev;
+		ev.fd = sockfd;
+		ev.flags = WANT_READ | WANT_WRITE | WANT_ERROR;
+		on_write(sockfd, ev);
 	}
 	return 0;
 }
@@ -215,7 +236,7 @@ ssl_connection::ssl_connection(cluster* creator, const std::string &_hostname, c
 	try {
 		ssl_connection::connect();
 	}
-	catch (std::exception&) {
+	catch (const std::exception&) {
 		cleanup();
 		throw;
 	}
@@ -260,15 +281,11 @@ void ssl_connection::connect() {
 	const dns_cache_entry* addr = resolve_hostname(hostname, port);
 	sfd = addr->make_connecting_socket();
 	address_t destination = addr->get_connecting_address(from_string<uint16_t>(this->port, std::dec));
-	if (sfd == ERROR_STATUS) {
-		err = errno;
-	} else {
-		start_connecting(sfd, destination.get_socket_address(), destination.size());
-	}
 	/* Check if valid connection started */
 	if (sfd == ERROR_STATUS) {
-		throw dpp::connection_exception(err_connect_failure, strerror(err));
+		throw dpp::connection_exception(err_connect_failure, get_socket_error());
 	}
+	start_connecting(sfd, destination.get_socket_address(), destination.size());
 }
 
 void ssl_connection::socket_write(const std::string_view data) {

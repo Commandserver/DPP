@@ -28,6 +28,7 @@
 #include <thread>
 #include <dpp/json.h>
 #include <dpp/etf.h>
+#include <utility>
 
 #define PATH_UNCOMPRESSED_JSON "/?v=" DISCORD_API_VERSION "&encoding=json"
 #define PATH_COMPRESSED_JSON "/?v=" DISCORD_API_VERSION "&encoding=json&compress=zlib-stream"
@@ -72,8 +73,12 @@ discord_client::discord_client(discord_client &old, uint64_t sequence, const std
 	  ready(false),
 	  last_heartbeat_ack(time(nullptr)),
 	  protocol(old.protocol),
+	  connecting_voice_channels(std::move(old.connecting_voice_channels)),
 	  resume_gateway_url(old.resume_gateway_url)
 {
+	for (auto& [shard_id, vconn] : connecting_voice_channels) {
+		vconn->reassign_owner(this);
+	}
 	start_connecting();
 }
 
@@ -358,8 +363,7 @@ void discord_client::error(uint32_t errorcode)
 	if (i != errortext.end()) {
 		error = i->second;
 	}
-	log(dpp::ll_warning, "OOF! Error from underlying websocket: " + std::to_string(errorcode) + ": " + error);
-	this->close();
+	throw dpp::connection_exception("OOF! Error from underlying websocket: " + std::to_string(errorcode) + ": " + error);
 }
 
 void discord_client::log(dpp::loglevel severity, const std::string &msg) const
@@ -615,5 +619,8 @@ voiceconn& voiceconn::connect(snowflake guild_id) {
 	return *this;
 }
 
+void voiceconn::reassign_owner(discord_client* o) {
+	creator = o;
+}
 
 }
